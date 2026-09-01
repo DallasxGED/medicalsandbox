@@ -19,7 +19,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Java 17 is required by the current Android sdkmanager
+      # Current Android sdkmanager requires Java 17.
       - name: Set up Java 17 for Android SDK
         uses: actions/setup-java@v4
         with:
@@ -29,13 +29,19 @@ jobs:
       - name: Reassemble Medical Sandbox ZIP
         shell: bash
         run: |
-          echo "Project pieces:"
+          echo "Finding project ZIP pieces..."
+
           ls -lh MedicalSandboxProject.zip.part*
 
           cat MedicalSandboxProject.zip.part* > MedicalSandboxProject.zip
 
-          echo "Testing rebuilt ZIP..."
+          echo "Reconstructed project ZIP:"
+          ls -lh MedicalSandboxProject.zip
+
+          echo "Testing ZIP integrity..."
           unzip -tq MedicalSandboxProject.zip
+
+          echo "ZIP reconstruction successful."
 
       - name: Unpack project
         shell: bash
@@ -49,6 +55,7 @@ jobs:
 
           if [ -z "$PROJECT_DIR" ]; then
             echo "ERROR: gradlew was not found inside MedicalSandboxProject.zip"
+            echo "Files found:"
             find build-project -maxdepth 5 -type f | head -200
             exit 1
           fi
@@ -58,8 +65,64 @@ jobs:
           sed -i 's/\r$//' "$PROJECT_DIR/gradlew"
           chmod +x "$PROJECT_DIR/gradlew"
 
-          echo "Project directory:"
+          echo "Medical Sandbox project directory:"
           echo "$PROJECT_DIR"
+
+      # AGP requires a namespace. The project application/package namespace
+      # is com.medicalcare.game.
+      - name: Fix Medical Sandbox Android namespace
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          gradle = project / "app" / "build.gradle"
+
+          if not gradle.exists():
+              raise SystemExit(
+                  "ERROR: app/build.gradle was not found at: " + str(gradle)
+              )
+
+          text = gradle.read_text(encoding="utf-8")
+
+          # Detect an existing namespace declaration.
+          namespace_pattern = re.compile(
+              r'^\s*namespace\s+[\'"][^\'"]+[\'"]',
+              re.MULTILINE
+          )
+
+          if namespace_pattern.search(text):
+              print("Android namespace already exists.")
+          else:
+              android_pattern = re.compile(r'android\s*\{')
+
+              match = android_pattern.search(text)
+
+              if not match:
+                  raise SystemExit(
+                      "ERROR: Could not find android { block in app/build.gradle"
+                  )
+
+              insertion = (
+                  text[:match.end()]
+                  + "\n    namespace 'com.medicalcare.game'"
+                  + text[match.end():]
+              )
+
+              gradle.write_text(insertion, encoding="utf-8")
+
+              print("Added:")
+              print("namespace 'com.medicalcare.game'")
+
+          print("")
+          print("Current app/build.gradle:")
+          print("----------------------------------------")
+          print(gradle.read_text(encoding="utf-8"))
+          print("----------------------------------------")
+          PY
 
       - name: Locate Android SDK
         shell: bash
@@ -74,17 +137,19 @@ jobs:
           fi
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager could not be found."
+            echo "ERROR: sdkmanager could not be found on the GitHub runner."
             exit 1
           fi
 
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
           echo "sdkmanager found at:"
           echo "$SDKMANAGER"
 
-      - name: Install Android SDK 33
+      - name: Install Android SDK
         shell: bash
         run: |
+          echo "Java used for sdkmanager:"
           java -version
 
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
@@ -92,10 +157,14 @@ jobs:
           "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-33" \
-            "build-tools;33.0.2"
+            "build-tools;33.0.2" \
+            "build-tools;30.0.3"
 
-      # Switch back because this Medical Sandbox branch uses the older
-      # AGP / Gradle toolchain intended for Java 11.
+          echo "Installed Android SDK packages:"
+          "$SDKMANAGER" --list_installed
+
+      # Medical Sandbox currently uses Gradle 7.3.3 / older AGP,
+      # so switch to Java 11 for the actual Android build.
       - name: Set up Java 11 for Medical Sandbox build
         uses: actions/setup-java@v4
         with:
@@ -105,29 +174,63 @@ jobs:
       - name: Show build environment
         shell: bash
         run: |
-          echo "Java used for Gradle:"
+          echo "========================================"
+          echo "JAVA"
+          echo "========================================"
           java -version
 
-          echo "Project:"
+          echo ""
+          echo "========================================"
+          echo "PROJECT DIRECTORY"
+          echo "========================================"
           echo "$PROJECT_DIR"
+
+          echo ""
+          echo "========================================"
+          echo "GRADLE"
+          echo "========================================"
 
           cd "$PROJECT_DIR"
           ./gradlew --version
+
+          echo ""
+          echo "========================================"
+          echo "APP BUILD.GRADLE"
+          echo "========================================"
+
+          cat app/build.gradle
+
+          echo ""
+          echo "========================================"
+          echo "ANDROID MANIFEST"
+          echo "========================================"
+
+          cat app/src/main/AndroidManifest.xml
 
       - name: Build Medical Sandbox APK
         shell: bash
         run: |
           cd "$PROJECT_DIR"
 
+          echo "Starting Medical Sandbox debug APK build..."
+
           ./gradlew \
             --no-daemon \
             --stacktrace \
+            --warning-mode all \
             :app:assembleDebug
 
-      - name: Find APK
+      - name: Find generated APK
         shell: bash
         run: |
           mkdir -p "$GITHUB_WORKSPACE/apk-output"
+
+          echo "Looking for generated APK files..."
+
+          find "$PROJECT_DIR/app/build/outputs" \
+            -type f \
+            -name '*.apk' \
+            -print || true
 
           APK="$(find "$PROJECT_DIR/app/build/outputs/apk" \
             -type f \
@@ -135,14 +238,23 @@ jobs:
             | head -n 1)"
 
           if [ -z "$APK" ]; then
-            echo "ERROR: No APK was generated."
-            find "$PROJECT_DIR/app/build" -type f | tail -200 || true
+            echo "ERROR: Gradle finished but no APK was found."
+
+            echo "Build output files:"
+            find "$PROJECT_DIR/app/build" \
+              -type f \
+              | tail -300 || true
+
             exit 1
           fi
+
+          echo "APK found:"
+          echo "$APK"
 
           cp "$APK" \
             "$GITHUB_WORKSPACE/apk-output/MedicalSandbox-v22.25.1-debug.apk"
 
+          echo "Final APK:"
           ls -lh \
             "$GITHUB_WORKSPACE/apk-output/MedicalSandbox-v22.25.1-debug.apk"
 
